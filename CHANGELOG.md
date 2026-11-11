@@ -8,6 +8,7 @@ Versions here identify the skill, not a Databend Cloud server release. Dates are
 - Add a standalone README, license copy, ignore rules, and a minimal offline-test workflow. Keep agent-guided installation and private API key setup; no new installer or runtime dependencies.
 - Remove evot-specific metadata from `SKILL.md` and adapt `scripts/layout_test.py` to portable dependencies and a standalone directory layout.
 - Add API token IP allowlist guidance to `references/authentication.md` and `references/errors.md`. No runtime scripts or credential formats change.
+- Pass the `X-DATABEND-ROUTE-HINT` response header back on later requests for the same query. On a multi-cluster warehouse, a page, status, kill, or final request without it can reach another cluster and fail with `Query ID ... not found`. `query.py` carries the latest hint automatically and prints `route_hint=` on stderr; `query_api.py` adds `--route-hint` and prints the hint of its response on stderr. Unsafe hint values are ignored or rejected. Documented in `references/query-api.md`.
 
 ## 1.1.0 — 2026-10-28
 

@@ -16,6 +16,10 @@ ConfigError = cloud_config.ConfigError
 USER_AGENT = "databend-cloud-skill/2"
 QUERY_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+# The gateway names the warehouse cluster that holds a query. Later requests for
+# that query must send it back, or they can reach another cluster and miss it.
+ROUTE_HINT_HEADER = "X-DATABEND-ROUTE-HINT"
+ROUTE_HINT = re.compile(r"^[A-Za-z0-9._-]{1,256}$")
 
 
 class QueryError(Exception):
@@ -23,10 +27,20 @@ class QueryError(Exception):
 
 
 class QueryResponse(dict):
-    """Keep trusted HTTP execution-source metadata out of the JSON payload."""
-    def __init__(self, payload, gateway_local=False):
+    """Keep trusted HTTP metadata (execution source, route hint) out of the JSON payload."""
+    def __init__(self, payload, gateway_local=False, route_hint=None):
         super().__init__(payload)
         self.gateway_local = gateway_local
+        self.route_hint = route_hint
+
+
+def valid_route_hint(value):
+    """Return the hint if it is a safe header value, else None."""
+    return value if isinstance(value, str) and ROUTE_HINT.fullmatch(value) else None
+
+
+def with_route_hint(headers, route_hint):
+    return {**headers, ROUTE_HINT_HEADER: route_hint} if route_hint else headers
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -42,7 +56,9 @@ def request(url, headers, payload=None, timeout=60, method=None):
     try:
         with urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout) as response:
             body = response.read(MAX_RESPONSE_BYTES + 1)
-            gateway_local = getattr(response, "headers", {}).get("X-Databend-Query-Source") == "gateway"
+            response_headers = getattr(response, "headers", {})
+            gateway_local = response_headers.get("X-Databend-Query-Source") == "gateway"
+            route_hint = valid_route_hint(response_headers.get(ROUTE_HINT_HEADER))
     except urllib.error.HTTPError as error:
         with error:
             if 300 <= error.code < 400:
@@ -64,7 +80,7 @@ def request(url, headers, payload=None, timeout=60, method=None):
         raise QueryError("API returned a non-JSON response; verify the API origin") from None
     if not isinstance(decoded, dict):
         raise QueryError("API returned an unexpected response shape")
-    return QueryResponse(decoded, gateway_local=gateway_local)
+    return QueryResponse(decoded, gateway_local=gateway_local, route_hint=route_hint)
 
 
 def raise_for_error(payload):
@@ -111,6 +127,15 @@ def run_once(sql, creds, timeout, max_rows=1000):
     query_id, schema, rows = "", [], []
     completed = False
     gateway_local = False
+    route_hint = None
+
+    def remember_route_hint(response):
+        # Carry the latest hint so pages, kill, and final reach the cluster that holds the query.
+        nonlocal route_hint
+        hint = getattr(response, "route_hint", None)
+        if hint and hint != route_hint:
+            route_hint = hint
+            print(f"route_hint={redact(route_hint, creds)}", file=sys.stderr)
 
     def remaining():
         seconds = deadline - time.monotonic()
@@ -125,6 +150,8 @@ def run_once(sql, creds, timeout, max_rows=1000):
         if isinstance(candidate, str) and QUERY_ID.fullmatch(candidate):
             query_id = candidate
             print(f"query_id={redact(query_id, creds)}", file=sys.stderr)
+        if not gateway_local:
+            remember_route_hint(page)
         raise_for_error(page)
         if not query_id:
             raise QueryError("Query response has no valid query ID; outcome is unknown, do not blindly resubmit")
@@ -160,7 +187,8 @@ def run_once(sql, creds, timeout, max_rows=1000):
                 break
             if not data:
                 time.sleep(min(0.2, remaining()))
-            page = request(next_url, headers, None, remaining())
+            page = request(next_url, with_route_hint(headers, route_hint), None, remaining())
+            remember_route_hint(page)
         if completed and len(data) > capacity and not following:
             print(f"WARN: output truncated to {max_rows} rows.", file=sys.stderr)
         return schema, rows
@@ -168,14 +196,15 @@ def run_once(sql, creds, timeout, max_rows=1000):
         if query_id and not gateway_local:
             # Gateway-local SQL has no query-node result lifecycle. Do not wake compute for cleanup.
             # Bounded best-effort cleanup; do not hide the original failure or re-submit SQL.
+            cleanup_headers = with_route_hint(headers, route_hint)
             if not completed:
                 try:
-                    reply = request(f"{root}/v1/query/{query_id}/kill", headers, {}, 5)
+                    reply = request(f"{root}/v1/query/{query_id}/kill", cleanup_headers, {}, 5)
                     raise_for_error(reply)
                 except QueryError as error:
                     print(redact(f"WARN: cancellation could not be confirmed; query_id={query_id}: {error}", creds), file=sys.stderr)
             try:
-                reply = request(f"{root}/v1/query/{query_id}/final", headers, None, 5)
+                reply = request(f"{root}/v1/query/{query_id}/final", cleanup_headers, None, 5)
                 raise_for_error(reply)
             except QueryError as error:
                 print(redact(f"WARN: finalization could not be confirmed; query_id={query_id}: {error}", creds), file=sys.stderr)

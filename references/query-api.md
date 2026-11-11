@@ -31,6 +31,20 @@ Keep the key outside model context and process arguments. A custom implementatio
 
 Use the same account, organization, and warehouse throughout a query lifecycle. Do not enumerate other query IDs or use another organization's headers to recover a failed request.
 
+## Route hint
+
+A warehouse can have more than one cluster, and a query runs on one of them. Each response through the gateway can carry an `X-DATABEND-ROUTE-HINT` response header that names that cluster. Send it back as a request header, with the value from the latest response, on every later request for the same query: status, pages, final, and kill. Without it, the gateway can route the request to another cluster, which does not have the query and returns `Query ID ... not found`. The helpers send no hint on a new `POST /v1/query`, because each invocation is an independent query. A custom client that deliberately continues a `session` should send the latest hint on its next `POST /v1/query`, so that the query runs on the cluster that holds the session state.
+
+```http
+GET /v1/query/<query-id>/page/1
+X-DATABENDCLOUD-TOKEN: <personal-api-token>
+X-DATABENDCLOUD-ORG: <organization-id>
+X-DATABENDCLOUD-WAREHOUSE: <warehouse-name>
+X-DATABEND-ROUTE-HINT: <latest-route-hint>
+```
+
+The hint is HTTP metadata, not part of the JSON body. `query.py` carries it automatically and prints `route_hint=<value>` on stderr when it is first seen or changes. `query_api.py` sends `--route-hint <value>` and prints the hint of its response on stderr. Hints contain only letters, digits, dots, underscores, and hyphens; the helpers ignore or reject other values. Responses can also carry `X-DATABEND-SESSION-ID`; it is used by the browser console and the helpers ignore it.
+
 ## Start SQL
 
 The minimum request body is:
@@ -74,9 +88,9 @@ For ordinary query-node executions:
 
 1. Check HTTP status and error fields. Record the query ID as soon as it is available.
 2. Collect schema and rows, keeping output bounded.
-3. If `next_uri` points to a page, fetch it with the same headers. Continue even after an empty page. A repeated URI can require a brief wait.
+3. If `next_uri` points to a page, fetch it with the same headers plus the latest [route hint](#route-hint). Continue even after an empty page. A repeated URI can require a brief wait.
 4. If `next_uri` points to final, or no continuation remains, finish collection and finalize the known query.
-5. If interrupted, timed out, or capped while unfinished, attempt cancellation and then finalization. Report cleanup failures and the query ID.
+5. If interrupted, timed out, or capped while unfinished, attempt cancellation and then finalization, both with the latest route hint. Report cleanup failures and the query ID.
 
 Do not follow arbitrary continuation URLs. The helper permits only the selected query's `/page/<number>` and `/final` paths on the configured HTTPS origin. It refuses redirects, foreign origins, other query IDs, query strings, and fragments, rather than forwarding the personal token.
 
@@ -91,22 +105,24 @@ The gateway executes management SQL locally and returns `X-Databend-Query-Source
 The lifecycle-only helper never submits SQL. It loads the same private credentials as `query.py` and requires the actual Organization ID on each request:
 
 ```bash
-python3 scripts/query_api.py status <query-id> --org <Organization-ID> --base-url <confirmed-api-origin>
-python3 scripts/query_api.py page <query-id> --page 0 --org <Organization-ID> --base-url <confirmed-api-origin> --max-rows 100
+python3 scripts/query_api.py status <query-id> --org <Organization-ID> --base-url <confirmed-api-origin> --route-hint <route-hint>
+python3 scripts/query_api.py page <query-id> --page 0 --org <Organization-ID> --base-url <confirmed-api-origin> --route-hint <route-hint> --max-rows 100
 ```
+
+Pass the latest `route_hint=` value that `query.py` or a previous `query_api.py` call printed on stderr. Without it, a query on a multi-cluster warehouse can be reported as not found even though it still exists. If no hint was printed, omit the option.
 
 Use the page number from the server-issued `next_uri`, not guessed pages. The helper performs exactly one request, prints one JSON response object (not schema-first JSON Lines), and never follows a returned URL or auto-finalizes a manually fetched page. Responses are capped at 16 MiB and `data` rows at `1000` by default; truncation is reported on stderr.
 
 Final releases stored results and can make unread pages unavailable. Kill interrupts execution. After explicit user authorization:
 
 ```bash
-python3 scripts/query_api.py kill <query-id> --org <Organization-ID> --base-url <confirmed-api-origin> --confirm
-python3 scripts/query_api.py final <query-id> --org <Organization-ID> --base-url <confirmed-api-origin> --confirm
+python3 scripts/query_api.py kill <query-id> --org <Organization-ID> --base-url <confirmed-api-origin> --route-hint <route-hint> --confirm
+python3 scripts/query_api.py final <query-id> --org <Organization-ID> --base-url <confirmed-api-origin> --route-hint <route-hint> --confirm
 ```
 
-`--confirm` is a client-side consent gate, not a substitute for server authorization. Do not use this helper to poll or finalize a completed gateway-local management statement. Query status is not an archival history endpoint; use authorized history SQL for old executions. A not-found status does not prove the original query never ran.
+`--confirm` is a client-side consent gate, not a substitute for server authorization. Do not use this helper to poll or finalize a completed gateway-local management statement. Query status is not an archival history endpoint; use authorized history SQL for old executions. A not-found status does not prove the original query never ran; first check that the request carried the query's latest route hint.
 
-To inspect an already known query, make an authenticated `GET /v1/query/{queryID}` using the original confirmed API origin, org, and warehouse. Report the returned state and error rather than assuming the query failed because a client lost contact.
+To inspect an already known query, make an authenticated `GET /v1/query/{queryID}` using the original confirmed API origin, org, warehouse, and latest route hint. Report the returned state and error rather than assuming the query failed because a client lost contact.
 
 For an authorized cancellation, make `POST /v1/query/{queryID}/kill` (an empty JSON object is sufficient), then attempt `GET /v1/query/{queryID}/final`. Check both responses. Cancelling another user's or a previously running query needs explicit user authorization; the helper's automatic cleanup only affects the query it just started.
 
@@ -124,6 +140,6 @@ Status/page transport recovery must remain bounded and must not restart the SQL.
 python3 scripts/query.py --org <Organization-ID> --base-url <confirmed-api-origin> --format json --max-rows 100 "SELECT * FROM analytics.events LIMIT 100"
 ```
 
-`json` is schema-first JSON Lines: line 1 is the schema array; every following line is a row array. It is not a single JSON object. Diagnostics, selected origin/org/warehouse, query ID, and truncation/cleanup warnings go to stderr. `table` truncates long cells for display, so use JSON for exact values. Timestamps are UTC.
+`json` is schema-first JSON Lines: line 1 is the schema array; every following line is a row array. It is not a single JSON object. Diagnostics, selected origin/org/warehouse, query ID, route hint, and truncation/cleanup warnings go to stderr. `table` truncates long cells for display, so use JSON for exact values. Timestamps are UTC.
 
-The helper is optional. A direct API client must implement the same credential safety, explicit origin/org/warehouse selection, lifecycle, and bounds.
+The helper is optional. A direct API client must implement the same credential safety, explicit origin/org/warehouse selection, route-hint pass-through, lifecycle, and bounds.

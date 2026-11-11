@@ -44,7 +44,7 @@ python3 scripts/cloud_config.py list-targets
 python3 scripts/cloud_config.py set-target <name> --org <Organization-ID> --base-url <confirmed-api-origin> [--warehouse <wh>] [--note "<what it serves>"]
 python3 scripts/query.py --target <name> "SELECT 1"
 python3 scripts/query.py --org <Organization-ID> --base-url <confirmed-api-origin> --format json --max-rows 100 "SELECT * FROM analytics.events LIMIT 100"
-python3 scripts/query_api.py status <query-id> --target <name>
+python3 scripts/query_api.py status <query-id> --target <name> [--route-hint <latest route_hint= from stderr>]
 ```
 
 The query helper bounds paging and lifecycle cleanup without resubmitting SQL. JSON is schema-first JSON Lines; `query_api.py` emits one JSON object. Each invocation is independent. Use fully qualified names, explicit bounds, and UTC predicates. See task references for additional arguments and gateway-local exceptions.

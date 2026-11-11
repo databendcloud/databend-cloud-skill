@@ -59,7 +59,7 @@ LIMIT 100
 
 An eligible account with the effective `account_admin` role can use bounded `QUERY_HISTORY` through the same Query API. This reads the gateway's query-details stream, not the history/profile console REST endpoints. See [Warehouse management and history](warehouse-management.md) for exact syntax, UTC windows, role checks, and limits. It is another source in the **same confirmed organization**, not permission to change tenants or claim missing telemetry exists.
 
-For a known ordinary query still retained by the query service, `scripts/query_api.py status <query-id> --org <Organization-ID> --base-url <confirmed-api-origin>` inspects execution without re-submitting SQL. A completed gateway-local management query's correlation ID is not a query-node result handle. See [Query API](query-api.md).
+For a known ordinary query still retained by the query service, `scripts/query_api.py status <query-id> --org <Organization-ID> --base-url <confirmed-api-origin> --route-hint <route-hint>` inspects execution without re-submitting SQL. Use the latest `route_hint=` value printed on stderr; omit the option if none was printed. A completed gateway-local management query's correlation ID is not a query-node result handle. See [Query API](query-api.md).
 
 ## Interpret the evidence
 

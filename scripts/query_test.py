@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline query/CLI tests. Only invented orgs, IDs, and synthetic credentials."""
 import contextlib
+import http.client
 import io
 import json
 import os
@@ -40,6 +41,31 @@ class RequestTest(unittest.TestCase):
         self.assertNotIn("gateway_local", result)
         ordinary, _ = self.send(b'{"id":"q","gateway_local":true}')
         self.assertFalse(ordinary.gateway_local)
+
+    def test_route_hint_is_retained_as_http_metadata_not_json(self):
+        headers = http.client.HTTPMessage()
+        headers["X-Databend-Route-Hint"] = "clextra01-a03c"
+        result, _ = self.send(b'{"id":"q"}', response_headers=headers)
+        self.assertEqual(result.route_hint, "clextra01-a03c")
+        self.assertNotIn("route_hint", result)
+        self.assertIsNone(self.send(b'{"id":"q","route_hint":"clx-1"}')[0].route_hint)
+
+    def test_unsafe_route_hint_is_ignored(self):
+        for value in ("cl a", "cl/x", "cl;x", "x" * 257, ""):
+            with self.subTest(value=value):
+                headers = http.client.HTTPMessage()
+                headers["X-Databend-Route-Hint"] = value
+                self.assertIsNone(self.send(b"{}", response_headers=headers)[0].route_hint)
+
+    def test_route_hint_is_sent_as_request_header(self):
+        opener = mock.Mock()
+        stream = io.BytesIO(b"{}")
+        stream.headers = {}
+        opener.open.return_value = stream
+        with mock.patch.object(query.urllib.request, "build_opener", return_value=opener):
+            query.request("https://api.databend.com/v1/query/q/page/1", query.with_route_hint({}, "clx-1"), None, 5)
+        self.assertEqual(opener.open.call_args.args[0].get_header("X-databend-route-hint"), "clx-1")
+        self.assertEqual(query.with_route_hint({"A": "1"}, None), {"A": "1"})
 
     def test_get_and_empty_post(self):
         self.assertEqual(self.send()[1].get_method(), "GET")
@@ -290,6 +316,88 @@ class PaginationTest(unittest.TestCase):
             self.assertEqual(query.run_once("SELECT 1", CREDS, 60)[1], [[1]])
         self.assertIn("finalization could not be confirmed", err.getvalue())
         self.assertNotIn(CREDS["api_key"], err.getvalue())
+
+
+class RouteHintTest(unittest.TestCase):
+    """A multi-cluster warehouse keeps a query on one cluster; follow-up calls must name it."""
+
+    def execute(self, responses, **kwargs):
+        calls = []
+        iterator = iter(responses)
+
+        def respond(url, headers, payload=None, timeout=60):
+            calls.append((url, dict(headers)))
+            item = next(iterator)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        with mock.patch.object(query, "request", respond), mock.patch.object(query.time, "sleep"), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            try:
+                result = query.run_once("SELECT 1", CREDS, 60, **kwargs)
+            except query.QueryError as error:
+                result = error
+        return result, calls, err.getvalue()
+
+    @staticmethod
+    def hint(call):
+        return call[1].get(query.ROUTE_HINT_HEADER)
+
+    def test_first_hint_is_sent_on_pages_and_final_but_not_on_start(self):
+        result, calls, err = self.execute([
+            query.QueryResponse({"id": "q", "data": [], "next_uri": "/v1/query/q/page/0"}, route_hint="cla-1"),
+            query.QueryResponse({"schema": SCHEMA, "data": [[1]], "next_uri": "/v1/query/q/page/1"}),
+            query.QueryResponse({"data": [[2]], "next_uri": "/v1/query/q/final"}),
+            {},
+        ])
+        self.assertEqual(result, (SCHEMA, [[1], [2]]))
+        self.assertEqual([call[0].rsplit("/v1/query", 1)[1] for call in calls], ["", "/q/page/0", "/q/page/1", "/q/final"])
+        self.assertEqual([self.hint(call) for call in calls], [None, "cla-1", "cla-1", "cla-1"])
+        self.assertIn("route_hint=cla-1", err)
+
+    def test_latest_hint_wins(self):
+        _, calls, _ = self.execute([
+            query.QueryResponse({"id": "q", "data": [], "next_uri": "/v1/query/q/page/0"}, route_hint="cla-1"),
+            query.QueryResponse({"schema": SCHEMA, "data": [[1]], "next_uri": "/v1/query/q/page/1"}, route_hint="clb-2"),
+            query.QueryResponse({"data": [], "next_uri": ""}),
+            {},
+        ])
+        self.assertEqual([self.hint(call) for call in calls], [None, "cla-1", "clb-2", "clb-2"])
+
+    def test_cleanup_after_cap_and_after_error_carries_hint(self):
+        _, calls, _ = self.execute([
+            query.QueryResponse({"id": "q", "schema": SCHEMA, "data": [[1], [2]], "next_uri": "/v1/query/q/page/0"},
+                                route_hint="cla-1"),
+            {}, {},
+        ], max_rows=1)
+        self.assertEqual([call[0].rsplit("/", 1)[-1] for call in calls], ["query", "kill", "final"])
+        self.assertEqual([self.hint(call) for call in calls[1:]], ["cla-1", "cla-1"])
+
+        result, calls, _ = self.execute([
+            query.QueryResponse({"id": "q", "data": [], "next_uri": "/v1/query/q/page/0"}, route_hint="cla-1"),
+            query.QueryError("HTTP 404: request failed"),
+            {}, {},
+        ])
+        self.assertIsInstance(result, query.QueryError)
+        self.assertEqual([call[0].rsplit("/", 1)[-1] for call in calls], ["query", "0", "kill", "final"])
+        self.assertEqual([self.hint(call) for call in calls[1:]], ["cla-1", "cla-1", "cla-1"])
+
+    def test_no_hint_means_no_header(self):
+        _, calls, err = self.execute([
+            {"id": "q", "data": [], "next_uri": "/v1/query/q/page/0"},
+            {"schema": SCHEMA, "data": [[1]], "next_uri": "/v1/query/q/final"},
+            {},
+        ])
+        self.assertTrue(all(self.hint(call) is None for call in calls))
+        self.assertNotIn("route_hint=", err)
+
+    def test_gateway_local_hint_is_not_used(self):
+        _, calls, err = self.execute([query.QueryResponse(
+            {"id": "management-query", "schema": SCHEMA, "data": [[1]], "state": "Succeeded"},
+            gateway_local=True, route_hint="cla-1")])
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("route_hint=", err)
 
 
 class MainTest(unittest.TestCase):

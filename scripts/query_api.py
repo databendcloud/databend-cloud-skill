@@ -22,11 +22,19 @@ def page_number(value):
     return number
 
 
+def route_hint(value):
+    if not query.valid_route_hint(value):
+        raise argparse.ArgumentTypeError("route hint must use letters, digits, dots, underscores, or hyphens (maximum 256 characters)")
+    return value
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Inspect or manage one known Cloud query; no SQL submission")
     parser.add_argument("operation", choices=("status", "page", "final", "kill"))
     parser.add_argument("query_id", type=query_id)
     parser.add_argument("--page", type=page_number, help="Page number from a server-issued next_uri")
+    parser.add_argument("--route-hint", type=route_hint,
+                        help="Latest X-DATABEND-ROUTE-HINT value of this query; routes the request to the cluster that holds it")
     parser.add_argument("--confirm", action="store_true", help="Confirm authorized cancellation or result release")
     parser.add_argument("--timeout", type=query.positive_int, default=30)
     parser.add_argument("--max-rows", type=query.positive_int, default=1000)
@@ -51,10 +59,15 @@ def main(argv=None):
         path += f"/{args.operation}"
     headers = {"Content-Type": "application/json", "X-DatabendCloud-Token": creds["api_key"],
                "X-DatabendCloud-Org": creds["org"], "X-DatabendCloud-Warehouse": creds["warehouse"]}
+    headers = query.with_route_hint(headers, args.route_hint)
     selected = f"org={creds['org']} warehouse={creds['warehouse']} base_url={root} query_id={args.query_id}"
     print(query.redact(selected, creds), file=sys.stderr)
     try:
         response = query.request(root + path, headers, {} if args.operation == "kill" else None, args.timeout)
+        returned_hint = getattr(response, "route_hint", None)
+        if returned_hint:
+            # Metadata for the next lifecycle call; stdout stays the JSON body only.
+            print(f"route_hint={query.redact(returned_hint, creds)}", file=sys.stderr)
         query.raise_for_error(response)
         data = response.get("data")
         if isinstance(data, list) and len(data) > args.max_rows:

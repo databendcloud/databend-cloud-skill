@@ -139,6 +139,33 @@ class QueryAPITest(unittest.TestCase):
         self.assertNotIn("[2]", output)
         self.assertIn("not a complete export", error)
 
+    def test_route_hint_option_is_sent_on_every_lifecycle_operation(self):
+        for argv in (["status", "q"], ["page", "q", "--page", "1"], ["kill", "q", "--confirm"], ["final", "q", "--confirm"]):
+            with self.subTest(argv=argv):
+                code, _, _, request, _ = self.invoke([*argv, "--route-hint", "clextra01-a03c"])
+                self.assertEqual(code, 0)
+                self.assertEqual(request.call_args.args[1][query.ROUTE_HINT_HEADER], "clextra01-a03c")
+
+    def test_no_route_hint_option_sends_no_header(self):
+        code, _, _, request, _ = self.invoke(["status", "q"])
+        self.assertEqual(code, 0)
+        self.assertNotIn(query.ROUTE_HINT_HEADER, request.call_args.args[1])
+
+    def test_unsafe_route_hint_is_rejected_before_config(self):
+        for value in ("cl a", "cl\nX-Other: 1", "cl/x", "x" * 257, ""):
+            with self.subTest(value=value):
+                code, _, _, request, resolver = self.invoke(["status", "q", "--route-hint", value])
+                self.assertEqual(code, 2)
+                request.assert_not_called()
+                resolver.assert_not_called()
+
+    def test_returned_route_hint_goes_to_stderr_not_stdout(self):
+        response = query.QueryResponse({"id": "q", "state": "Running"}, route_hint="clb-2")
+        code, output, error, _, _ = self.invoke(["status", "q", "--route-hint", "cla-1"], response=response)
+        self.assertEqual(code, 0)
+        self.assertIn("route_hint=clb-2", error)
+        self.assertNotIn("clb-2", output)
+
     def test_independent_account_file_and_timeout_are_forwarded(self):
         code, _, _, request, resolver = self.invoke(["status", "q", "--credentials-file", "/private/work.json", "--timeout", "7"])
         self.assertEqual(code, 0)
